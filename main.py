@@ -1,20 +1,76 @@
-from datasets import load_dataset
-from torchvision import transforms
-from torch.utils.data import Dataset, DataLoader
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+import numpy as np
+import pandas as pd
 import torch
-import torchvision.models as models
-from sklearn.model_selection import train_test_split
+import torch.nn.functional as F
+from torchvision import models, transforms
+import joblib
+from PIL import Image
+import io
 
-# 1. Load dataset (HF → Python list)
-hf_dataset = load_dataset("aneeshd27/Corals-Classification")["train"]
-data = list(hf_dataset)
+# ----------------------------------------------------
+# FastAPI setup
+# ----------------------------------------------------
+app = FastAPI(title="DeepReef AI Backend")
 
-# 2. Train / test split
-train_data, test_data = train_test_split(
-    data, test_size=0.2, random_state=42
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# 3. Image transforms
+# ----------------------------------------------------
+# Device
+# ----------------------------------------------------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ----------------------------------------------------
+# Load ResNet50 model
+# ----------------------------------------------------
+MODEL_PATH = "resnet50_coral.pth"
+NUM_CLASSES = 2
+
+model = models.resnet50(weights=None)
+model.fc = torch.nn.Linear(model.fc.in_features, NUM_CLASSES)
+
+model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+model.to(DEVICE)
+model.eval()
+
+CLASS_LABELS = ["Bleached Coral", "Healthy Coral"]
+
+# ----------------------------------------------------
+# Load XGBoost model + encoder + columns
+# ----------------------------------------------------
+rf = joblib.load("xgboost_env_severity_model.pkl")
+label_encoder = joblib.load("label_encoder.pkl")
+X_train_columns = joblib.load("train_columns-2.pkl")
+
+# ----------------------------------------------------
+# Handle encoder safely (dict or LabelEncoder)
+# ----------------------------------------------------
+index_to_label = {}
+
+if isinstance(label_encoder, dict):
+    # label -> index  OR  index -> label
+    sample_value = next(iter(label_encoder.values()))
+    if isinstance(sample_value, int):
+        # label -> index  → invert
+        index_to_label = {v: k for k, v in label_encoder.items()}
+    else:
+        # already index -> label
+        index_to_label = label_encoder
+else:
+    # sklearn LabelEncoder
+    for i, label in enumerate(label_encoder.classes_):
+        index_to_label[i] = label
+
+# ----------------------------------------------------
+# Image preprocessing (ResNet50)
+# ----------------------------------------------------
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
@@ -24,78 +80,85 @@ transform = transforms.Compose([
     )
 ])
 
-# 4. Simple PyTorch Dataset
-class CoralDataset(Dataset):
-    def __init__(self, data, transform):
-        self.data = data
-        self.transform = transform
+def preprocess_image(uploaded_file: UploadFile):
+    img_bytes = uploaded_file.file.read()
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    img = transform(img).unsqueeze(0)
+    return img.to(DEVICE)
 
-    def __len__(self):
-        return len(self.data)
+# ----------------------------------------------------
+# Main endpoint
+# ----------------------------------------------------
+@app.post("/analyze_coral")
+async def analyze_coral(
+    file: UploadFile = File(...),
+    Temperature_Mean: float = Form(...),
+    Windspeed: float = Form(...),
+    TSA: float = Form(...),
+    Ocean_Name: str = Form(...),
+    Exposure: str = Form(...)
+):
+    # -------- Image inference --------
+    img_tensor = preprocess_image(file)
+    with torch.no_grad():
+        outputs = model(img_tensor)
+        probs = F.softmax(outputs, dim=1)
+        idx = int(torch.argmax(probs, dim=1).item())
+        confidence = float(probs[0][idx].item())
 
-    def __getitem__(self, idx):
-        image = self.data[idx]["image"].convert("RGB")
-        label = self.data[idx]["label"]
-        image = self.transform(image)
-        return image, label
+    coral_status = CLASS_LABELS[idx]
 
-train_dataset = CoralDataset(train_data, transform)
-test_dataset = CoralDataset(test_data, transform)
+    # -------- Normalize categorical inputs --------
+    ocean = Ocean_Name.strip().lower()
+    exposure = Exposure.strip().lower()
 
-# 5. DataLoaders (NO workers, Windows-safe)
-train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=16)
+    if "pacific" in ocean:
+        ocean = "Pacific"
+    elif "atlantic" in ocean:
+        ocean = "Atlantic"
+    else:
+        ocean = "Unknown"
 
-# 6. Model
-model = models.resnet50(pretrained=True)
-model.fc = torch.nn.Linear(model.fc.in_features, 2)
+    if "sheltered" in exposure:
+        exposure = "Sheltered"
+    elif "exposed" in exposure:
+        exposure = "Exposed"
+    else:
+        exposure = "Unknown"
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(device)
+    # -------- XGBoost inference --------
+    df = pd.DataFrame([{
+        "Temperature_Mean": Temperature_Mean,
+        "Windspeed": Windspeed,
+        "TSA": TSA,
+        "Ocean_Name": ocean,
+        "Exposure": exposure
+    }])
 
-# 7. Loss & optimizer
-criterion = torch.nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    df_enc = pd.get_dummies(df, columns=["Ocean_Name", "Exposure"], drop_first=True)
 
-# 8. Training loop
-epochs = 5
-for epoch in range(epochs):
-    model.train()
-    running_loss = 0.0
+    for col in X_train_columns:
+        if col not in df_enc.columns:
+            df_enc[col] = 0
 
-    for images, labels in train_loader:
-        images = images.to(device)
-        labels = labels.to(device)
+    df_enc = df_enc[X_train_columns]
 
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+    severity_pred = rf.predict(df_enc)
+    severity_index = int(severity_pred[0])
+    severity = index_to_label.get(severity_index, "Unknown")
 
-        running_loss += loss.item()
+    return {
+        "image_prediction": coral_status,
+        "confidence": round(confidence * 100, 2),
+        "bleaching_severity": severity
+    }
 
-    print(f"Epoch {epoch+1}/{epochs}, Loss: {running_loss / len(train_loader):.4f}")
-
-# 9. Evaluation
-model.eval()
-correct = 0
-total = 0
-
-with torch.no_grad():
-    for images, labels in test_loader:
-        images = images.to(device)
-        labels = labels.to(device)
-
-        outputs = model(images)
-        _, preds = torch.max(outputs, 1)
-
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
-
-accuracy = correct / total
-print(f"Test Accuracy: {accuracy * 100:.2f}%")
-
-# 10. Save model
-torch.save(model.state_dict(), "resnet50_coral.pth")
-print("Model saved")
+# ----------------------------------------------------
+# Root endpoint
+# ----------------------------------------------------
+@app.get("/")
+def root():
+    return {
+        "message": "DeepReef AI backend running",
+        "endpoint": "/analyze_coral"
+    }
